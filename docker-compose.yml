@@ -1,0 +1,129 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aegis
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/001-aegis.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ./infra/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_data:/var/tempo
+    ports: ["3200:3200", "4319:4317"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3200/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=24h"]
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports: ["9090:9090"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/ready | grep -q Prometheus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    working_dir: /app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      STORAGE_BACKEND: postgres
+      POSTGRES_URL: postgresql://aegis:aegis@postgres:5432/aegis
+      PROMETHEUS_URL: http://prometheus:9090
+      TEMPO_URL: http://tempo:3200
+      LLM_PROVIDER: ${LLM_PROVIDER:-local}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-15}
+      OPENAI_API_KEY: ${OPENAI_API_KEY-}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173,http://127.0.0.1:8080
+    depends_on:
+      postgres: {condition: service_healthy}
+      prometheus: {condition: service_healthy}
+      tempo: {condition: service_started}
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./infra/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      backend: {condition: service_healthy}
+      tempo: {condition: service_healthy}
+    ports: ["4317:4317", "4318:4318", "8889:8889"]
+    # The upstream image is shell-less; validate the loaded config with the native binary.
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol/config.yaml"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  demo-payment:
+    build:
+      context: .
+      dockerfile: demo_services/Dockerfile
+    environment:
+      SERVICE_NAME: payment-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      FAILURE_MODE: ""
+    depends_on:
+      otel-collector: {condition: service_started}
+    ports: ["8004:8004"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  traffic-generator:
+    build:
+      context: .
+      dockerfile: demo_services/Dockerfile
+    command: ["python", "-m", "demo_services.traffic_generator"]
+    environment:
+      TARGET_URL: http://demo-payment:8004/checkout
+    depends_on:
+      demo-payment: {condition: service_started}
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    depends_on: {backend: {condition: service_healthy}}
+    ports: ["8080:80"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  postgres_data:
+  tempo_data:
+  prometheus_data:
